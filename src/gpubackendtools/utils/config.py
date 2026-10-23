@@ -1,4 +1,29 @@
-"""Implementation of a centralized configuration management for GPUBACKENDTOOLS."""
+"""Implementation of a centralized configuration management for GPUBACKENDTOOLS.
+
+A :class:`ConfigConsumer` declares :class:`ConfigEntry` objects and builds one
+:class:`ConfigItem` (value + :class:`ConfigSource`) per entry from, in increasing priority:
+the entry default, a config file, ``GPUBACKENDTOOLS_*`` environment variables, CLI
+arguments, and values set programmatically (``set_args``). Unconsumed file / env / CLI
+options are kept as "extras" for a following consumer.
+
+:class:`~gpubackendtools.globals.Globals` runs two consumers at initialization:
+:class:`InitialConfigConsumer` (``--ignore-env``, ``--ignore-config-file``,
+``--config-file``) and :class:`Configuration` (the live options; env var, CLI flag,
+config-file key):
+
+- ``log_level``: ``GPUBACKENDTOOLS_LOG_LEVEL``, ``--log-level``, ``log-level``; default
+  ``logging.WARN``.
+- ``log_format``: ``GPUBACKENDTOOLS_LOG_FORMAT``, ``--log-format``, ``log-format``; default
+  ``None``.
+- ``enabled_backends``: ``GPUBACKENDTOOLS_ENABLED_BACKENDS``, ``--enable-backend``,
+  ``enabled-backends``; default ``None``.
+
+plus ``-v`` / ``--verbose`` (repeatable, lowers the level by 10 each) and ``-Q`` /
+``--quiet``. The config file is an INI file with a ``[gpubackendtools]`` section, found by
+:func:`detect_cfg_file` unless given explicitly (``GPUBACKENDTOOLS_CONFIG_FILE`` or
+``--config-file``). When ``gpubackendtools`` initializes itself at import, no CLI arguments
+are passed.
+"""
 
 from __future__ import annotations
 
@@ -52,7 +77,12 @@ ENVVAR_PREFIX: str = "GPUBACKENDTOOLS_"
 
 @dataclasses.dataclass
 class ConfigEntry(Generic[T]):
-    """Description of a configuration entry."""
+    """Description of a configuration entry.
+
+    Each field below is documented inline. ``convert`` defaults to calling ``type`` on the
+    raw value; ``validate`` defaults to accepting everything; ``overwrite`` defaults to
+    keeping the newer value.
+    """
 
     label: str
     """How the entry is referred to in Python code (config.get("label"))"""
@@ -69,7 +99,7 @@ class ConfigEntry(Generic[T]):
     """Name of the entry in a config file"""
 
     env_var: Optional[str] = None
-    """Entry corresponding env var (uppercase, without GPUBACKENDTOOLS_ prefix)"""
+    """Entry corresponding env var (uppercase, without the ``GPUBACKENDTOOLS_`` prefix)"""
 
     cli_flags: Optional[Union[str, List[str]]] = None
     """Flag(s) for CLI arguments of this entry (e.g. "-f")"""
@@ -92,6 +122,21 @@ class ConfigEntry(Generic[T]):
 
 
 def compatibility_isinstance(obj, cls) -> bool:
+    """``isinstance`` that also accepts ``Optional`` / ``Union``, ``List[T]``, ``Sequence[T]``.
+
+    Plain ``isinstance`` is tried first; for subscripted generics, which it rejects, the
+    check recurses into the ``Union`` members or into every element of a list / iterable.
+
+    Args:
+        obj: Object to test.
+        cls: A class or a typing construct.
+
+    Returns:
+        bool: Whether ``obj`` matches ``cls``.
+
+    Raises:
+        NotImplementedError: For other typing constructs.
+    """
     import sys
     import typing
 
@@ -144,6 +189,24 @@ class ConfigConsumer(abc.ABC):
 
     This class handles building config values from default, file, environment and CLI options.
     It keeps a list of unused parameters for an other consumer.
+
+    Priority, lowest to highest: entry default, ``config_file``, ``env_vars`` (only keys
+    starting with ``GPUBACKENDTOOLS_``), ``cli_args``, ``set_args``; when several sources
+    give a value the entry's ``overwrite`` merges them. Values are read as
+    ``consumer["label"]`` or ``consumer.label``.
+
+    Args:
+        config_file: INI file (its ``[gpubackendtools]`` section is read) or an
+            already-parsed mapping. Default ``None``.
+        env_vars: Environment, e.g. ``os.environ``. Default ``None``.
+        cli_args: Command-line arguments. Default ``None``.
+        set_args: Already-converted values keyed by label. Default ``None``.
+
+    Raises:
+        AttributeError: When an entry ends up without a value or a value fails
+            ``validate``: the intended ``exceptions.ConfigurationMissing`` /
+            ``exceptions.ConfigurationValidationError`` classes do not exist in
+            :mod:`gpubackendtools.exceptions`.
     """
 
     _entries: Dict[str, ConfigEntry]
@@ -234,6 +297,7 @@ class ConfigConsumer(abc.ABC):
         new_items: Dict[str, ConfigItem],
         *other_items,
     ) -> Dict[str, ConfigItem]:
+        """Merge item maps left to right; a later map wins, through each entry's ``overwrite``."""
         merged_items = {}
         for label, old_item in old_items.items():
             if label not in new_items:
@@ -264,9 +328,11 @@ class ConfigConsumer(abc.ABC):
         return self.__getattribute__(attr)
 
     def get_item(self, key: str) -> Tuple[ConfigItem, ConfigEntry]:
+        """Return the ``(item, entry)`` pair of label ``key``."""
         return self._items[key], self._entries[key]
 
     def get_items(self) -> List[Tuple[ConfigItem, ConfigEntry]]:
+        """Return the ``(item, entry)`` pairs of every entry, in declaration order."""
         return [(self._items[key], entry) for key, entry in self._entries.items()]
 
     def get_extras(self) -> Tuple[Mapping[str, str], Mapping[str, str], Sequence[str]]:
@@ -341,7 +407,7 @@ class ConfigConsumer(abc.ABC):
     def _build_items_from_env(
         config_entries: Sequence[ConfigEntry], opt_from_env: Mapping[str, str]
     ) -> Tuple[Dict[str, ConfigItem], Dict[str, str]]:
-        """Extract configuration items from file option and build dict of unconsumed extra items."""
+        """Extract configuration items from env vars and build dict of unconsumed extra items."""
         extras_from_env = {**opt_from_env}
         items_from_env = {
             entry.label: ConfigItem(
@@ -360,6 +426,10 @@ class ConfigConsumer(abc.ABC):
         config_entries: Sequence[ConfigEntry],
         parent_parsers: Optional[Sequence[argparse.ArgumentParser]] = None,
     ) -> argparse.ArgumentParser:
+        """Build an ``argparse`` parser for the entries that have CLI flags.
+
+        The parser has no ``--help`` and suppresses absent options (``dest`` = label).
+        """
         parser = argparse.ArgumentParser(
             add_help=False,
             argument_default=argparse.SUPPRESS,
@@ -385,7 +455,7 @@ class ConfigConsumer(abc.ABC):
     def _build_items_from_cli(
         config_entries: Sequence[ConfigEntry], opt_from_cli: Sequence[str]
     ) -> Tuple[Dict[str, ConfigItem], List[str]]:
-        """Extract configuration items from file option and build dict of unconsumed extra items."""
+        """Extract configuration items from CLI arguments and build list of unconsumed args."""
         parser = ConfigConsumer._build_parser(config_entries)
         parsed_options, extras_from_cli = parser.parse_known_args(opt_from_cli)
 
@@ -412,7 +482,11 @@ class ConfigConsumer(abc.ABC):
     def _build_items_from_set(
         config_entries: Sequence[ConfigEntry], set_values: Optional[Dict[str, Any]]
     ) -> Dict[str, ConfigItem]:
-        """Check that provided items match the entries."""
+        """Check that provided items match the entries.
+
+        Values are NOT converted; each is validated with its entry's ``validate`` and
+        unknown labels are ignored.
+        """
         set_items = {}
 
         if set_values is None:
@@ -433,7 +507,16 @@ class ConfigConsumer(abc.ABC):
 
 
 def userstr_to_bool(user_str: str) -> Optional[bool]:
-    """Convert a yes/no, on/off or true/false to bool."""
+    """Convert a yes/no, on/off or true/false to bool.
+
+    Case-insensitive prefix match: ``y``, ``t``, ``on``, ``1`` give ``True``; ``n``, ``f``,
+    ``off``, ``0`` give ``False``; anything else gives ``None``.
+
+    Example:
+        >>> from gpubackendtools.utils.config import userstr_to_bool
+        >>> userstr_to_bool("Yes"), userstr_to_bool("off"), userstr_to_bool("maybe")
+        (True, False, None)
+    """
     if user_str.lower().startswith(("y", "t", "on", "1")):
         return True
     if user_str.lower().startswith(("n", "f", "off", "0")):
@@ -442,7 +525,19 @@ def userstr_to_bool(user_str: str) -> Optional[bool]:
 
 
 def userinput_to_pathlist(user_input) -> List[pathlib.Path]:
-    """Convert a user input to a list of paths"""
+    """Convert a user input to a list of paths.
+
+    Args:
+        user_input (str | Sequence[str] | Sequence[pathlib.Path] | None): A
+            ``;``-separated string, a sequence of strings or of paths, or ``None``.
+
+    Returns:
+        list[pathlib.Path]: The paths (empty for ``None``; a sequence of paths is returned
+        as given).
+
+    Raises:
+        ValueError: For other input types.
+    """
     if user_input is None:
         return []
     if isinstance(user_input, str):
@@ -459,7 +554,23 @@ def userinput_to_pathlist(user_input) -> List[pathlib.Path]:
 
 
 def userinput_to_strlist(user_input) -> List[str]:
-    """Convert a user input to a list of paths"""
+    """Convert a user input to a list of strings.
+
+    Args:
+        user_input (str | Sequence[str] | None): A string separated by spaces or ``;``, a
+            sequence of strings, or ``None``.
+
+    Returns:
+        list[str]: The strings (empty for ``None``).
+
+    Raises:
+        ValueError: For other input types.
+
+    Example:
+        >>> from gpubackendtools.utils.config import userinput_to_strlist
+        >>> userinput_to_strlist("gbt_cpu;gbt_cuda12x")
+        ['gbt_cpu', 'gbt_cuda12x']
+    """
     if user_input is None:
         return []
     if isinstance(user_input, str):
@@ -481,6 +592,15 @@ class InitialConfigConsumer(ConfigConsumer):
 
     On first pass, we only detect if there are CLI arguments which disable
     config file or environment variables.
+
+    Entries: ``ignore_cfg`` (``--ignore-config-file``, ``GPUBACKENDTOOLS_IGNORE_CFG_FILE``),
+    ``ignore_env`` (``--ignore-env``; CLI only) and ``config_file`` (``-C`` /
+    ``--config-file``, ``GPUBACKENDTOOLS_CONFIG_FILE``; must be an existing file). No
+    config file is read by this consumer.
+
+    Args:
+        env_vars: Environment. Default ``None``.
+        cli_args: Command-line arguments. Default ``None``.
     """
 
     ignore_cfg: bool
@@ -489,6 +609,7 @@ class InitialConfigConsumer(ConfigConsumer):
 
     @staticmethod
     def config_entries() -> List[ConfigEntry]:
+        """Return the ``ignore_cfg``, ``ignore_env`` and ``config_file`` entries."""
         return [
             ConfigEntry(
                 label="ignore_cfg",
@@ -532,6 +653,7 @@ class InitialConfigConsumer(ConfigConsumer):
 
 
 def get_package_basepath() -> pathlib.Path:
+    """Return the directory of the installed ``gpubackendtools`` package."""
     import gpubackendtools
 
     return pathlib.Path(gpubackendtools.__file__).parent
@@ -540,6 +662,31 @@ def get_package_basepath() -> pathlib.Path:
 class Configuration(ConfigConsumer):
     """
     Class implementing GPUBACKENDTOOLS complete configuration for the library.
+
+    Live entries: ``log_level`` (int, default ``logging.WARN``; names such as ``"debug"``
+    are converted), ``log_format`` (str or ``None``) and ``enabled_backends`` (list of
+    lower-cased names or ``None``); see the module docstring for their env vars, CLI flags
+    and file keys. After the sources are merged, ``-v`` / ``--verbose`` (repeatable) lowers
+    ``log_level`` by 10 per flag down to ``DEBUG`` and ``-Q`` / ``--quiet`` sets
+    ``CRITICAL``. The ``file_*`` attributes declared on the class have no entry (their
+    definitions are commented out), so reading them raises ``AttributeError``.
+
+    Args:
+        config_file: INI file or mapping. Default ``None``.
+        env_vars: Environment. Default ``None``.
+        cli_args: Command-line arguments. Default ``None``.
+        set_args: Values keyed by label (highest priority). Default ``None``.
+
+    Warning:
+        A non-empty ``enabled_backends`` list fails validation with ``NameError``
+        (``KNOWN_BACKENDS`` is not defined), and the backend registry ignores the value
+        anyway.
+
+    Example:
+        >>> from gpubackendtools.utils.config import Configuration
+        >>> cfg = Configuration(env_vars={"GPUBACKENDTOOLS_LOG_LEVEL": "info"})
+        >>> cfg.log_level
+        20
     """
 
     log_level: int
@@ -555,6 +702,7 @@ class Configuration(ConfigConsumer):
 
     @staticmethod
     def config_entries() -> List[ConfigEntry]:
+        """Return the ``log_level``, ``log_format`` and ``enabled_backends`` entries."""
         return [
             ConfigEntry(
                 label="log_level",
@@ -694,6 +842,7 @@ class Configuration(ConfigConsumer):
 
     @staticmethod
     def _str_to_logging_level(input: Union[str, int]) -> int:
+        """Convert a level name (any case) or int to a ``logging`` level int."""
         if isinstance(input, int):
             return input
         as_int_level = logging.getLevelName(input.upper())
@@ -704,6 +853,7 @@ class Configuration(ConfigConsumer):
         )
 
     def _apply_verbosity(self, level):
+        """Override ``log_level`` with ``level`` (source CLI)."""
         self._items["log_level"] = ConfigItem(value=level, source=ConfigSource.CLIOPT)
 
     @staticmethod
@@ -729,6 +879,7 @@ class Configuration(ConfigConsumer):
         return parser
 
     def _handle_verbosity(self):
+        """Apply ``-v`` / ``-Q`` from the leftover CLI arguments and drop them from the extras."""
         parser = self._build_verbosity_parser()
         parsed_options, self._extra_cli = parser.parse_known_args(self._extra_cli)
 
@@ -754,7 +905,12 @@ class Configuration(ConfigConsumer):
             )
 
     def build_cli_parent_parsers(self) -> List[argparse.ArgumentParser]:
-        """Build a Parser that can be used as parent parser from CLI-specific parsers"""
+        """Build a Parser that can be used as parent parser from CLI-specific parsers.
+
+        Returns:
+            list[argparse.ArgumentParser]: One parser with every ``InitialConfigConsumer``
+            and ``Configuration`` flag plus ``-v`` / ``-Q``, for ``parents=``.
+        """
         init_parser = ConfigConsumer._build_parser(
             InitialConfigConsumer.config_entries()
         )
@@ -767,7 +923,15 @@ class Configuration(ConfigConsumer):
 
 
 def detect_cfg_file() -> Optional[pathlib.Path]:
-    """Test common path locations for config and return highest-priority existing one (if any)."""
+    """Test common path locations for config and return highest-priority existing one (if any).
+
+    Checked in order: ``./gpubackendtools.ini``, ``<user config dir>/gpubackendtools.ini``
+    and ``<site config dir>/gpubackendtools/v<major>.<minor>/gpubackendtools.ini``
+    (directories from ``platformdirs``).
+
+    Returns:
+        pathlib.Path or None: The first existing file, or ``None``.
+    """
     import platformdirs
 
     from .. import __version_tuple__

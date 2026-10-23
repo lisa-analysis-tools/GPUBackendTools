@@ -1,3 +1,12 @@
+"""Legacy helpers turning NumPy / CuPy arrays into raw pointers for Cython entry points.
+
+:func:`wrapper` replaces array arguments by their data addresses (``int``) and objects with
+a ``ptr`` attribute by that attribute; :func:`pointer_adjust` is the decorator form. The
+active native path of the stack is nanobind, which takes arrays directly; these helpers
+remain for Cython-era code. Whether CuPy arrays are recognized is decided once, at import
+(module flag ``gpu``).
+"""
+
 # check to see if cupy is available for gpus
 import numpy as np
 
@@ -13,7 +22,7 @@ except (ImportError, ModuleNotFoundError):
 
 
 def wrapper(*args, **kwargs):
-    """Function to convert array and C/C++ class arguments to ptrs
+    """Function to convert array and C/C++ class arguments to ptrs.
 
     This function checks the object type. If it is a cupy or numpy array,
     it will determine its pointer by calling the proper attributes. If you design
@@ -26,14 +35,25 @@ def wrapper(*args, **kwargs):
     `here <https://github.com/BlackHolePerturbationToolkit/FastEMRIWaveforms/tree/master/src>`_
     for examples.
 
-    args:
-        *args (list): list of the arguments for a function.
-        **kwargs (dict): dictionary of keyword arguments to be converted.
+    For a ``cupy.ndarray`` the value is ``arg.data.mem.ptr`` (the start of the underlying
+    allocation, which differs from the array start for an offset view); for a
+    ``numpy.ndarray`` it is ``arg.__array_interface__["data"][0]``. Other arguments pass
+    through unchanged.
 
-    returns:
-        Tuple: (targs, tkwargs) where t indicates target (with pointer values
-            rather than python objects).
+    Args:
+        *args: Positional arguments of a function.
+        **kwargs: Keyword arguments of a function.
 
+    Returns:
+        tuple[list, dict]: ``(targs, tkwargs)`` where t indicates target (with pointer
+        values rather than python objects).
+
+    Example:
+        >>> import numpy as np
+        >>> from gpubackendtools import wrapper
+        >>> targs, tkwargs = wrapper(np.zeros(4), 3, flag=True)
+        >>> isinstance(targs[0], int), targs[1], tkwargs
+        (True, 3, {'flag': True})
     """
     # declare target containers
     targs = []
@@ -85,10 +105,10 @@ def wrapper(*args, **kwargs):
 
 
 def pointer_adjust(func):
-    """Decorator function for cupy/numpy agnostic cython
+    """Decorator function for cupy/numpy agnostic cython.
 
-    This decorator applies :func:`few.utils.utility.wrapper` to functions
-    via the decorator construction.
+    This decorator applies :func:`wrapper` to the arguments of every call before
+    forwarding them to ``func``.
 
     If you use this decorator, you must convert input arrays to size_t data type in Cython and
     then properly cast the pointer as it enters the c++ function. See the
@@ -96,6 +116,11 @@ def pointer_adjust(func):
     `here <https://github.com/BlackHolePerturbationToolkit/FastEMRIWaveforms/tree/master/src>`_
     for examples.
 
+    Args:
+        func (Callable): Function taking pointer (``int``) arguments.
+
+    Returns:
+        Callable: Wrapper calling ``func(*targs, **tkwargs)``.
     """
 
     def func_wrapper(*args, **kwargs):

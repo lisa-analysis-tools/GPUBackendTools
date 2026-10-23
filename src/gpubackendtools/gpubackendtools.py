@@ -1,3 +1,36 @@
+"""Backend abstractions and the backend registry of ``gpubackendtools``.
+
+A *backend* is one compute flavor of one package: an array module ``xp`` (``numpy``,
+``cupy`` or ``jax.numpy``) plus the compiled (or pure-Python) callables of that package for
+that device. This module holds the generic machinery every package in the stack builds on:
+
+- :class:`Backend`: the abstract base, with :class:`Backend.Feature` flags, the registry
+  name contract (``_name`` / ``_backend_name``) and the singleton copy / pickle semantics.
+- :class:`CpuBackend`, :class:`Cuda11xBackend`, :class:`Cuda12xBackend`,
+  :class:`Cuda13xBackend`: abstract per-device bases that run the availability checks
+  (plugin module installed, CuPy usable, CUDA driver version, NVIDIA shared libraries).
+- :class:`BackendMethods`: the dataclass base of the per-package method tables.
+- :class:`BackendsManager`: the lazy registry (name -> :class:`BackendStatus`) held by
+  :class:`~gpubackendtools.globals.Globals`.
+
+A downstream package defines one concrete class per flavor, for example::
+
+    class MyPkgCpuBackend(CpuBackend, MyPkgBackend):
+        _name = "mypkg_cpu"                  # registry key, "<pkg>_<flavor>"
+        _backend_name = "mypkg_backend_cpu"  # importable plugin module
+
+        @staticmethod
+        def cpu_methods_loader() -> MyPkgBackendMethods:
+            import mypkg_backend_cpu.ext     # raise BackendUnavailableException on failure
+            ...
+
+and registers all flavors at import time with
+``Globals().backends_manager.add_backends({"mypkg_cpu": MyPkgCpuBackend, ...})``.
+The concrete GBT classes are in :mod:`gpubackendtools.cutils` and
+:mod:`gpubackendtools.jax.backend`; user-facing lookup functions are in
+:mod:`gpubackendtools.globals`.
+"""
+
 from __future__ import annotations
 import dataclasses
 import enum
@@ -9,15 +42,37 @@ from .exceptions import GPUBACKENDTOOLSException
 
 
 class BackendUnavailableException(GPUBACKENDTOOLSException):
-    """Exception raised when the backend is not available."""
+    """Exception raised when the backend is not available.
+
+    This is the class :meth:`BackendsManager._try_loading_backend` catches to mark a backend
+    :class:`BackendStatusUnavailable`; backend constructors and loaders signal "cannot load
+    here" by raising it (or a subclass). It is a different class from
+    :class:`gpubackendtools.exceptions.BackendUnavailableException`, which the manager does
+    NOT catch.
+    """
 
 
 class BackendNotInstalled(BackendUnavailableException):
-    """Exception raised when the backend has not been installed"""
+    """Exception raised when the backend plugin module cannot be imported.
+
+    Raised by :meth:`Backend._check_module_installed`.
+    """
 
 
 class MissingDependencies(BackendUnavailableException):
-    """Exception raised when the backend has missing dependencies"""
+    """Exception raised when the backend has missing dependencies.
+
+    ``str(exc)`` appends ready-to-run ``pip install`` / ``conda install`` hints built from
+    the two lists.
+
+    Args:
+        *args: Forwarded to :class:`Exception` (the message).
+        pip_deps: Packages to install in a pip-managed environment. Required,
+            keyword-only; may be empty.
+        conda_deps: Packages to install in a conda-managed environment. Required,
+            keyword-only; may be empty.
+        **kwargs: Forwarded to :class:`Exception`.
+    """
 
     pip_deps: typing.List[str]
     """List of missing dependencies to install in pip-managed environments"""
@@ -50,7 +105,11 @@ class MissingDependencies(BackendUnavailableException):
 
 
 class MissingDriver(BackendUnavailableException):
-    """Exception raised when backend needs driver-like software to be installed."""
+    """Exception raised when backend needs driver-like software to be installed.
+
+    Raised by the CUDA checks when the NVIDIA driver is not loaded or its CUDA version is
+    outside the backend's supported range.
+    """
 
 
 class SoftwareException(BackendUnavailableException):
@@ -63,6 +122,18 @@ class MissingHardware(BackendUnavailableException):
 
 @dataclasses.dataclass
 class BackendMethods:
+    """Base dataclass of a backend's method table.
+
+    Each package subclasses it and adds one field per native symbol it exposes (see
+    :class:`gpubackendtools.cutils.GBTBackendMethods`); the per-flavor loaders
+    (``cpu_methods_loader``, ``cuda12x_module_loader``, ...) build and return an instance.
+    :class:`Backend` copies ``xp`` from it; the package mixin copies the other fields.
+
+    Attributes:
+        xp (types.ModuleType): Array module of the backend (``numpy``, ``cupy`` or
+            ``jax.numpy``).
+    """
+
     xp: types.ModuleType
 
 
@@ -81,6 +152,19 @@ def _resolve_backend_for_unpickle(backend_name: str) -> "Backend":
     When unpickling in a fresh process the owning package may not have been
     imported yet; the registry-name prefix doubles as the import name for
     every downstream package, so try importing it before giving up.
+
+    Args:
+        backend_name: Registry key of the backend (``Backend.name``, e.g. ``"gbt_cpu"``).
+
+    Returns:
+        Backend: The instance currently registered under ``backend_name``.
+
+    Raises:
+        ValueError: If the name is unknown and importing its prefix does not register it.
+        ImportError: If the prefix package cannot be imported (raised with the original
+            ``ValueError`` as context).
+        BackendAccessException: If the backend is registered but disabled or unavailable
+            in this process.
     """
     from .globals import get_backend
 
@@ -97,12 +181,49 @@ def _resolve_backend_for_unpickle(backend_name: str) -> "Backend":
 
 
 class Backend:
-    """Abstract definition of a backend"""
+    """Abstract definition of a backend.
+
+    A backend instance is a process-wide singleton owned by the
+    :class:`BackendsManager` registry: it is built lazily on first lookup and then shared
+    by every object that resolves the same registry name (a later
+    :meth:`BackendsManager.add_backends` call resets the registry, after which the next
+    lookup builds a new instance). Concrete subclasses must set two class attributes:
+
+    - ``_name``: the registry key, ``"<pkg>_<flavor>"`` (``"gbt_cpu"``,
+      ``"lisatools_cuda12x"``, ...). Exposed as :attr:`name`; this is what
+      :func:`~gpubackendtools.globals.get_backend` and pickling use.
+    - ``_backend_name``: the importable plugin module, ``"<pkg>_backend_<flavor>"``
+      (``"gbt_backend_cpu"``). Exposed as :attr:`backend_name`; this is what
+      :meth:`_check_module_installed` imports. Do not confuse it with :attr:`name`.
+
+    Copy and pickle never duplicate a backend: ``copy.copy`` and ``copy.deepcopy`` return
+    the same instance, and pickling stores only :attr:`name`, which unpickling resolves
+    through the registry of the receiving process (importing the owning package if
+    needed). Objects holding a backend (or its name) are therefore deepcopy- and
+    pickle-safe; do not cache ``xp`` as a plain attribute elsewhere, expose it as a
+    property derived from the backend.
+
+    Args:
+        name: Ignored (kept for the subclass call signature); the registry name comes from
+            the ``_name`` class attribute.
+        methods: Method table of the backend; only its ``xp`` field is read here.
+        features: Feature flags of the backend.
+
+    Attributes:
+        xp (types.ModuleType): Array module of the backend.
+        features (Backend.Feature): Feature flags.
+    """
 
     xp: types.ModuleType
     """Reference to package handling the backend ndarrays (numpy or cupy for now)"""
 
     class Feature(enum.Flag):
+        """Capability flags a backend declares (combine with ``|``).
+
+        CPU backends declare ``NUMPY``; CUDA backends declare ``CUPY | CUDA | GPU``; the
+        GBT JAX backend declares ``NUMPY``.
+        """
+
         NUMPY = enum.auto()
         """Flag indicating that backend uses numpy.ndarray"""
 
@@ -148,6 +269,7 @@ class Backend:
         return self
 
     def __reduce__(self):
+        """Pickle as a registry-name reference, resolved by ``_resolve_backend_for_unpickle``."""
         # Same singleton rationale as __deepcopy__/__copy__, but for PICKLE,
         # which ignores those two hooks entirely: by default pickle walks
         # __dict__ and dies on the module reference in self.xp with
@@ -161,7 +283,8 @@ class Backend:
         # `_resolve_backend_for_unpickle(<registry name>)` to look the Backend
         # up in the global BackendsManager. A Backend is never serialized as a
         # value, only as a name to re-resolve:
-        #   * same process: loads(dumps(b)) is b — the identical singleton;
+        #   * same process: loads(dumps(b)) is b — the identical singleton
+        #     (unless a later add_backends() call rebuilt the registry);
         #   * fresh process: loads() reconnects to THAT process's registered
         #     backend (importing the owning package first if needed).
         #
@@ -181,7 +304,15 @@ class Backend:
 
     @staticmethod
     def _check_module_installed(backend_name: str, module_name: str):
-        """Check that the module containing the backend implementation is installed."""
+        """Check that the module containing the backend implementation is installed.
+
+        Args:
+            backend_name: Name used in the error message.
+            module_name: Plugin module to import (``Backend.backend_name``).
+
+        Raises:
+            BackendNotInstalled: If importing ``module_name`` raises ``ModuleNotFoundError``.
+        """
         import importlib
         try:
             importlib.import_module(module_name)
@@ -191,7 +322,14 @@ class Backend:
             ) from e
 
     def supports(self, feature: Feature) -> bool:
-        """Check whether a backend supports a given feature"""
+        """Check whether a backend supports a given feature.
+
+        Args:
+            feature: Flag (or combination of flags) to test.
+
+        Returns:
+            bool: ``True`` if every flag in ``feature`` is set in :attr:`features`.
+        """
         return feature in self.features
 
     @property
@@ -216,24 +354,43 @@ class Backend:
 
     @property
     def name(self) -> str:
+        """Registry key of the backend (the ``_name`` class attribute, e.g. ``"gbt_cpu"``).
+
+        Raises:
+            ValueError: If the subclass does not define ``_name``.
+        """
         if not hasattr(self, "_name"):
             raise ValueError("Child class must have _name attribute set.")
         return self._name
 
     @property
     def backend_name(self) -> str:
+        """Plugin module name (the ``_backend_name`` class attribute, e.g. ``"gbt_backend_cpu"``).
+
+        Raises:
+            ValueError: If the subclass does not define ``_backend_name``.
+        """
         if not hasattr(self, "_backend_name"):
             raise ValueError("Child class must have _backend_name attribute set.")
         return self._backend_name
     
     @property
     def backend_base(self) -> str:
+        """Device flavor of the backend: the part of :attr:`name` after its last ``_``.
+
+        For example ``"cuda12x"`` for ``"lisatools_cuda12x"`` and ``"cpu"`` for
+        ``"gbt_cpu"``; the whole name if it has no ``_``. Passing it as ``force_backend`` to
+        a package class that prefixes bare names (e.g.
+        :class:`~gpubackendtools.parallelbase.GBTParallelModuleBase`) selects the same device
+        in that package.
+        """
         if "_" in self.name:
             return self.name.split("_")[-1]
         else:
             return self.name
 
 
+# TODO check: keep/remove/document -- no callers; references undefined GPUBACKENDTOOLSBackendMethods
 class GPUBACKENDTOOLSBackend:
     get_ll: typing.Callable[(...), None]
     fill_global: typing.Callable[(...), None]
@@ -250,15 +407,43 @@ class GPUBACKENDTOOLSBackend:
 
 
 class CpuBackend(Backend, abc.ABC):
-    """Implementation of the CPU backend"""
+    """Abstract base of every CPU (NumPy) backend.
+
+    Construction checks that the plugin module ``backend_name`` is importable, calls
+    :meth:`cpu_methods_loader` and declares ``Backend.Feature.NUMPY``. A concrete subclass
+    sets ``_name`` / ``_backend_name`` and implements :meth:`cpu_methods_loader`; see
+    :class:`gpubackendtools.cutils.GBTCpuBackend`.
+
+    Raises:
+        BackendNotInstalled: If the plugin module is not installed.
+        BackendUnavailableException: Whatever :meth:`cpu_methods_loader` raises.
+    """
 
     @staticmethod
     @abc.abstractmethod
     def cpu_methods_loader() -> BackendMethods:
+        """Import the CPU plugin module and return the backend method table.
+
+        Must be overridden. Implementations raise
+        :class:`gpubackendtools.gpubackendtools.BackendUnavailableException` (or a
+        subclass) when the module cannot be loaded, so the manager records the backend as
+        unavailable.
+
+        Returns:
+            BackendMethods: The package's method table with ``xp=numpy``.
+        """
         raise not NotImplementedError
 
     @staticmethod
     def check_numpy() -> typing.ModuleType:
+        """Import and return ``numpy``.
+
+        Returns:
+            types.ModuleType: The ``numpy`` module.
+
+        Raises:
+            MissingDependencies: If numpy cannot be imported.
+        """
         try:
             import numpy
         except (ModuleNotFoundError, ImportError) as e:
@@ -284,11 +469,23 @@ class CpuBackend(Backend, abc.ABC):
 
 
 class _CudaBackend(Backend):
-    """Implementation of generic CUDA backend"""
+    """Shared CUDA availability checks for the ``Cuda*xBackend`` classes.
+
+    Provides :meth:`check_cuda_backend` (the full load sequence), the NVIDIA shared-library
+    preloader and :meth:`set_cuda_device`.
+    """
 
     @staticmethod
     def _get_cuda_version() -> typing.Tuple[int, int]:
-        """Get the CUDA version or raise an exception"""
+        """Get the CUDA version supported by the installed driver, via ``pynvml``.
+
+        Returns:
+            tuple[int, int]: ``(major, minor)`` CUDA version of the driver.
+
+        Raises:
+            MissingDriver: If the NVIDIA driver is not loaded.
+            SoftwareException: If NVML fails or lacks the version query.
+        """
         try:
             import pynvml
 
@@ -313,6 +510,16 @@ class _CudaBackend(Backend):
 
     @staticmethod
     def _check_cupy_works(cuda_major: int):
+        """Check that CuPy imports, targets CUDA ``cuda_major`` and can run a kernel.
+
+        Args:
+            cuda_major: Expected CUDA major version of the CuPy runtime.
+
+        Raises:
+            MissingDependencies: If CuPy is missing, built for another CUDA major version, or
+                cannot compile (missing CUDA runtime).
+            SoftwareException: If CuPy cannot query the runtime version or execute.
+        """
         try:
             import cupy
             import cupy_backends.cuda
@@ -367,7 +574,18 @@ class _CudaBackend(Backend):
 
     @staticmethod
     def _try_import_nvidia_solib(libs: typing.Sequence[NvidiaSoLib]) -> None:
-        """Try to load a set of Nvidia dynamic libraries"""
+        """Try to load a set of Nvidia dynamic libraries with ``ctypes``.
+
+        Each library is tried first by soname (system search path), then from the
+        ``nvidia/<module_name>/lib/`` directory of the ``nvidia-*`` pip wheels.
+
+        Args:
+            libs: Libraries to load.
+
+        Raises:
+            MissingDependencies: If any library fails both attempts; lists the matching
+                pip / conda packages.
+        """
         import ctypes
         import importlib
         import pathlib
@@ -431,7 +649,40 @@ class _CudaBackend(Backend):
         module_loader: typing.Callable[[], None],  # Method loading
         dynlib_loader: typing.Optional[typing.Callable[[], None]] = None,
     ) -> BackendMethods:
-        """Perform all tests to ensure that a CUDA backend can be used"""
+        """Perform all tests to ensure that a CUDA backend can be used, and load it.
+
+        The sequence is:
+
+        1. import ``backend_module_name`` (the plugin wheel);
+        2. check CuPy targets CUDA ``cuda_min[0]`` and runs;
+        3. call ``module_loader()`` and return its result if it succeeds;
+        4. otherwise check the driver CUDA version lies in ``[cuda_min, cuda_max)``;
+        5. retry ``module_loader()``;
+        6. if that fails and ``dynlib_loader`` is given, preload the NVIDIA shared libraries
+           with it and call ``module_loader()`` a last time.
+
+        Only :class:`gpubackendtools.gpubackendtools.BackendUnavailableException` raised by
+        ``module_loader`` triggers the fallback steps; any other exception propagates.
+
+        Args:
+            name: Short flavor name used in error messages (``"cuda12x"``).
+            backend_module_name: Plugin module to import (``Backend.backend_name``).
+            cuda_min: Inclusive minimum ``(major, minor)`` driver CUDA version.
+            cuda_max: Exclusive maximum ``(major, minor)`` driver CUDA version.
+            module_loader: Zero-argument callable returning the method table.
+            dynlib_loader: Optional zero-argument callable that preloads shared libraries.
+                Default ``None``.
+
+        Returns:
+            BackendMethods: The table returned by ``module_loader``.
+
+        Raises:
+            MissingDependencies: Plugin module missing (the pip hint always names
+                ``gpubackendtools-cuda<N>x``), CuPy unusable, or shared libraries missing.
+            MissingDriver: Driver CUDA version outside ``[cuda_min, cuda_max)``.
+            SoftwareException: CuPy or NVML failures.
+            BackendUnavailableException: ``module_loader`` still failing at the last step.
+        """
 
         # 1. Check backend module is installed
         try:
@@ -487,22 +738,57 @@ class _CudaBackend(Backend):
         return module_loader()
 
     def set_cuda_device(self, dev: int):
-        """Globally sets CUDA device"""
+        """Set the current CUDA device with ``cupy.cuda.runtime.setDevice``.
+
+        The CUDA runtime keeps the current device per host thread, so this affects every
+        CuPy allocation and kernel launch made afterwards from the calling thread, for all
+        packages. Only CUDA backends define this method.
+
+        Args:
+            dev: CUDA device ordinal.
+        """
         from cupy.cuda.runtime import setDevice
 
         setDevice(dev)
 
 
 class Cuda11xBackend(_CudaBackend, abc.ABC):
-    """Implementation of CUDA 11.x backend"""
+    """Abstract base of every CUDA 11.x (CuPy) backend.
+
+    Construction runs :meth:`_CudaBackend.check_cuda_backend` with the driver range
+    ``[11.2, 12.0)`` and declares ``Feature.CUPY | Feature.CUDA | Feature.GPU``. A concrete
+    subclass sets ``_name`` / ``_backend_name`` and implements :meth:`cuda11x_module_loader`.
+
+    Warning:
+        ``__init__`` passes ``Cuda11xBackend.cuda11x_module_loader`` (this abstract method)
+        to the checks, not the subclass override as the 12.x / 13.x classes do. Once the
+        plugin module and CuPy checks pass, loading raises ``NotImplementedError``, which
+        the registry does not catch.
+    """
 
     @staticmethod
     @abc.abstractmethod
     def cuda11x_module_loader():
+        """Import the CUDA 11.x plugin module and return the backend method table.
+
+        Must be overridden; raise
+        :class:`gpubackendtools.gpubackendtools.BackendUnavailableException` on failure.
+
+        Returns:
+            BackendMethods: The package's method table with ``xp=cupy``.
+        """
         raise NotImplementedError
 
     @staticmethod
     def cuda11x_dynlib_loader():
+        """Preload the CUDA 11 shared libraries (Linux only; a no-op elsewhere).
+
+        Loads ``libcudart``, ``libcublas``, ``libnvJitLink``, ``libcusparse`` and ``libnvrtc``
+        ``.so.11`` from the system search path or the ``nvidia-*-cu11`` pip wheels.
+
+        Raises:
+            MissingDependencies: If a library cannot be loaded.
+        """
         import sys
 
         if sys.platform == "linux":
@@ -548,7 +834,7 @@ class Cuda11xBackend(_CudaBackend, abc.ABC):
             _CudaBackend._try_import_nvidia_solib(cuda11x_solibs)
 
     def __init__(self):
-        """Initialize the CPU backend"""
+        """Initialize the CUDA 11.x backend."""
 
         if self.backend_name is None:
             raise ValueError("Child class must declare `backend_name` class attribute.")
@@ -572,15 +858,38 @@ class Cuda11xBackend(_CudaBackend, abc.ABC):
 
 
 class Cuda12xBackend(_CudaBackend, abc.ABC):
-    """Implementation of CUDA 12.x backend"""
+    """Abstract base of every CUDA 12.x (CuPy) backend.
+
+    Construction runs :meth:`_CudaBackend.check_cuda_backend` with the driver range
+    ``[12.0, 13.0)`` and the subclass's :meth:`cuda12x_module_loader` /
+    :meth:`cuda12x_dynlib_loader`, and declares ``Feature.CUPY | Feature.CUDA | Feature.GPU``.
+    A concrete subclass sets ``_name`` / ``_backend_name`` and implements
+    :meth:`cuda12x_module_loader`; see :class:`gpubackendtools.cutils.GBTCuda12xBackend`.
+    """
 
     @staticmethod
     @abc.abstractmethod
     def cuda12x_module_loader():
+        """Import the CUDA 12.x plugin module and return the backend method table.
+
+        Must be overridden; raise
+        :class:`gpubackendtools.gpubackendtools.BackendUnavailableException` on failure.
+
+        Returns:
+            BackendMethods: The package's method table with ``xp=cupy``.
+        """
         raise NotImplementedError
 
     @staticmethod
     def cuda12x_dynlib_loader():
+        """Preload the CUDA 12 shared libraries (Linux only; a no-op elsewhere).
+
+        Loads ``libcudart``, ``libcublas``, ``libnvJitLink``, ``libcusparse`` and ``libnvrtc``
+        ``.so.12`` from the system search path or the ``nvidia-*-cu12`` pip wheels.
+
+        Raises:
+            MissingDependencies: If a library cannot be loaded.
+        """
         import sys
 
         if sys.platform == "linux":
@@ -626,7 +935,7 @@ class Cuda12xBackend(_CudaBackend, abc.ABC):
             _CudaBackend._try_import_nvidia_solib(cuda12x_solibs)
 
     def __init__(self):
-        """Initialize the CPU backend"""
+        """Initialize the CUDA 12.x backend."""
 
         if self.backend_name is None:
             raise ValueError("Child class must declare `backend_name` class attribute.")
@@ -650,15 +959,38 @@ class Cuda12xBackend(_CudaBackend, abc.ABC):
         
         
 class Cuda13xBackend(_CudaBackend, abc.ABC):
-    """Implementation of CUDA 13.x backend"""
+    """Abstract base of every CUDA 13.x (CuPy) backend.
+
+    Construction runs :meth:`_CudaBackend.check_cuda_backend` with the driver range
+    ``[13.0, 14.0)`` and the subclass's :meth:`cuda13x_module_loader` /
+    :meth:`cuda13x_dynlib_loader`, and declares ``Feature.CUPY | Feature.CUDA | Feature.GPU``.
+    A concrete subclass sets ``_name`` / ``_backend_name`` and implements
+    :meth:`cuda13x_module_loader`; see :class:`gpubackendtools.cutils.GBTCuda13xBackend`.
+    """
 
     @staticmethod
     @abc.abstractmethod
     def cuda13x_module_loader():
+        """Import the CUDA 13.x plugin module and return the backend method table.
+
+        Must be overridden; raise
+        :class:`gpubackendtools.gpubackendtools.BackendUnavailableException` on failure.
+
+        Returns:
+            BackendMethods: The package's method table with ``xp=cupy``.
+        """
         raise NotImplementedError
 
     @staticmethod
     def cuda13x_dynlib_loader():
+        """Preload the CUDA 13 shared libraries (Linux only; a no-op elsewhere).
+
+        Loads ``libcudart``, ``libcublas``, ``libnvJitLink``, ``libcusparse`` and ``libnvrtc``
+        ``.so.13`` from the system search path or the ``nvidia-*-cu13`` pip wheels.
+
+        Raises:
+            MissingDependencies: If a library cannot be loaded.
+        """
         import sys
 
         if sys.platform == "linux":
@@ -704,7 +1036,7 @@ class Cuda13xBackend(_CudaBackend, abc.ABC):
             _CudaBackend._try_import_nvidia_solib(cuda13x_solibs)
 
     def __init__(self):
-        """Initialize the CPU backend"""
+        """Initialize the CUDA 13.x backend."""
 
         if self.backend_name is None:
             raise ValueError("Child class must declare `backend_name` class attribute.")
@@ -737,7 +1069,11 @@ class BackendStatusUnloaded(BackendStatus):
 
 @dataclasses.dataclass
 class BackendStatusLoaded(BackendStatus):
-    """Backend loaded successfully"""
+    """Backend loaded successfully.
+
+    Attributes:
+        instance (Backend): The constructed backend singleton.
+    """
 
     instance: Backend
 
@@ -748,44 +1084,88 @@ class BackendStatusDisabled(BackendStatus):
 
 @dataclasses.dataclass
 class BackendStatusUnavailable:
-    """Backend could not be loaded due to exception"""
+    """Backend could not be loaded due to exception.
+
+    Attributes:
+        reason (BackendUnavailableException): The exception raised by the constructor.
+    """
 
     reason: BackendUnavailableException
 
 
 class BackendAccessException(GPUBACKENDTOOLSException):
-    """Method raised by BackendManager if requested backend cannot be accessed"""
+    """Exception raised by :class:`BackendsManager` if a requested backend cannot be accessed.
+
+    Raised for disabled or unavailable backends; the load failure, when there is one, is
+    attached as ``__cause__``.
+    """
 
 
 class BackendsManager:
-    """Handles loading and accessing backend instances."""
+    """Handles loading and accessing backend instances.
+
+    One manager lives in :attr:`gpubackendtools.globals.Globals.backends_manager`; every
+    package registers its backend classes there. The manager keeps two maps:
+
+    - ``_known_backends`` (a CLASS attribute, shared by all managers): registry key ->
+      backend class, filled by :meth:`add_backend` / :meth:`add_backends`;
+    - ``_registry`` (per instance): registry key -> :class:`BackendStatus`. A backend
+      starts :class:`BackendStatusUnloaded` and is constructed on its first lookup; the
+      result (:class:`BackendStatusLoaded` or :class:`BackendStatusUnavailable`) is cached.
+
+    Registration order is preserved and matters for :meth:`get_first_backend` with bare
+    flavor names. Every :meth:`add_backends` call rebuilds ``_registry`` for all known
+    backends, so backends loaded earlier are constructed again on their next lookup.
+
+    Args:
+        enabled_backends: Accepted but currently ignored; the registry starts empty.
+            Default ``None``.
+
+    Example:
+        .. code-block:: python
+
+            from gpubackendtools import Globals
+
+            manager = Globals().backends_manager
+            manager.add_backends(
+                {"mypkg_cpu": MyPkgCpuBackend, "mypkg_cuda12x": MyPkgCuda12xBackend}
+            )
+            manager.has_backend("mypkg_cpu")  # True if the plugin loads
+            manager.get_first_backend(["mypkg_cuda12x", "mypkg_cpu"]).name
+    """
 
     _known_backends: typing.Dict = {}
     _registry: typing.Dict[str, BackendStatus]
 
     @property
     def backend_list(self) -> typing.List[str]:
-        """Return the list of backend names"""
+        """Return the list of backend names.
+
+        Returns:
+            list[str]: Registry keys in registration order (empty until
+            :meth:`add_backends` has run).
+        """
         return [name for name in self._registry.keys()]
 
     def __init__(self, enabled_backends: typing.Optional[typing.Sequence[str]] = None):
-        """
+        """Create an empty registry; ``enabled_backends`` is not used."""
         # TODO: how do we handle this as we go to other packages.
-        Initialize the backend registry.
-
-        enabled_backends: optional list of backend names which must be loaded, others will be disabled
-        """
         self._registry = {}
 
     def _initialize_backend(
         self, enabled_backends: typing.Optional[typing.Sequence[str]] = None
     ):
+        """Rebuild the registry with every known backend marked unloaded.
+
+        Args:
+            enabled_backends: If given, each listed backend is loaded immediately and
+                every other one is disabled. Default ``None`` (nothing loaded or
+                disabled); :meth:`add_backends` always passes ``None``.
+
+        Raises:
+            BackendAccessException: If an enabled backend cannot be loaded.
         """
         # TODO: how do we handle this as we go to other packages.
-        Initialize the backend registry.
-
-        enabled_backends: optional list of backend names which must be loaded, others will be disabled
-        """
 
         self._registry = {
             name: BackendStatusUnloaded() for name in self._known_backends.keys()
@@ -812,7 +1192,19 @@ class BackendsManager:
         """
         Try to load a backend and return its new status.
 
-        If current status is different from UNLOADED, return it directly.
+        If current status is different from UNLOADED, return it directly. Otherwise the
+        backend class is instantiated; a
+        :class:`gpubackendtools.gpubackendtools.BackendUnavailableException` is recorded as
+        :class:`BackendStatusUnavailable`, any other exception propagates to the caller.
+
+        Args:
+            backend_name: Exact registry key.
+
+        Returns:
+            BackendStatus: The (possibly new) status of the backend.
+
+        Raises:
+            ValueError: If ``backend_name`` is not a registry key.
         """
         if backend_name not in self._registry:
             raise ValueError(
@@ -837,7 +1229,21 @@ class BackendsManager:
         return new_status
 
     def get_backend(self, backend_name: str) -> Backend:
-        """Get a backend instance or raise a BackendAccessException"""
+        """Get a backend instance or raise a BackendAccessException.
+
+        No alias handling: ``backend_name`` must be an exact registry key. The ``"cuda"`` /
+        ``"gpu"`` aliases are resolved by :func:`gpubackendtools.globals.get_backend`.
+
+        Args:
+            backend_name: Exact registry key (``"gbt_cpu"``).
+
+        Returns:
+            Backend: The loaded backend singleton.
+
+        Raises:
+            ValueError: If ``backend_name`` is not a registry key.
+            BackendAccessException: If the backend is disabled or failed to load.
+        """
         status = self._try_loading_backend(backend_name=backend_name)
         if isinstance(status, BackendStatusDisabled):
             raise BackendAccessException(
@@ -856,14 +1262,48 @@ class BackendsManager:
         return status.instance
 
     def has_backend(self, backend_name: str) -> bool:
-        """Check if a backend is available"""
+        """Check if a backend is available.
+
+        Tries to load it on first call.
+
+        Args:
+            backend_name: Exact registry key.
+
+        Returns:
+            bool: ``True`` if the backend is loaded, ``False`` if disabled or unavailable.
+
+        Raises:
+            ValueError: If ``backend_name`` is not a registry key.
+        """
         return isinstance(
             self._try_loading_backend(backend_name=backend_name), BackendStatusLoaded
         )
 
     # TODO: need to figure this out!!!
     def get_first_backend(self, backends: typing.Sequence[str]) -> Backend:
-        """Get first available backend from a list or raise BackendAccessException if none available"""
+        """Get first available backend from a list or raise BackendAccessException if none is.
+
+        Each entry is either an exact registry key (``"lisatools_cuda12x"``) or a bare
+        flavor (``"cuda12x"``). A bare flavor resolves to the FIRST registry key, in
+        registration order, whose part after the last ``_`` equals it; because
+        ``gpubackendtools`` registers ``gbt_*`` at import, a bare ``"cpu"`` therefore
+        resolves to ``"gbt_cpu"``, not to the calling package's backend. Packages that
+        want their own backends pass prefixed names (see
+        :meth:`gpubackendtools.parallelbase.ParallelModuleBase.supported_backends`).
+
+        Args:
+            backends: Candidate names in order of preference; must not be empty.
+
+        Returns:
+            Backend: The first candidate that loads.
+
+        Raises:
+            AssertionError: If ``backends`` is empty.
+            ValueError: If a candidate reached before a loadable one is neither a registry
+                key nor a registered flavor.
+            BackendAccessException: If every candidate is disabled or unavailable (the
+                reasons are attached as an ``ExceptionGroup`` cause).
+        """
         assert len(backends) > 0
 
         reasons: typing.List[BackendUnavailableException] = []
@@ -909,15 +1349,44 @@ class BackendsManager:
         )
 
     def add_backend(self, name: str, backend: Backend):
+        """Record a backend class under a registry key, without refreshing the registry.
+
+        The backend is not visible to lookups until :meth:`add_backends` (which rebuilds
+        the registry) runs; prefer :meth:`add_backends`.
+
+        Args:
+            name: Registry key; should equal the class's ``_name``.
+            backend: Backend CLASS (not an instance); it is instantiated on first lookup.
+        """
         self._known_backends[name] = backend
 
     def add_backends(self, backends: typing.Dict[str, Backend]):
+        """Register backend classes and rebuild the registry.
+
+        This is how a package publishes its backends, once at import time. Every known
+        backend (from every package) is reset to unloaded, so previously loaded instances
+        are rebuilt on their next lookup.
+
+        Args:
+            backends: Mapping registry key -> backend CLASS, e.g.
+                ``{"gbt_cpu": GBTCpuBackend, "gbt_cuda12x": GBTCuda12xBackend}``.
+
+        Example:
+            .. code-block:: python
+
+                from gpubackendtools import Globals
+
+                Globals().backends_manager.add_backends(
+                    {"mypkg_cpu": MyPkgCpuBackend, "mypkg_cuda12x": MyPkgCuda12xBackend}
+                )
+        """
         for key, value in backends.items():
             self.add_backend(key, value)
         # TODO: configuration added here?
         self._initialize_backend()
 
 
+# TODO check: keep/remove/document -- no callers in GBT or any downstream package
 @dataclasses.dataclass
 class GpuBackendToolConsumer:
     name: str = None

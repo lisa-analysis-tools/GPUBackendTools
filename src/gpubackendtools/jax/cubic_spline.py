@@ -1,4 +1,4 @@
-"""JAX-native cubic-spline fit + evaluation.
+r"""JAX-native cubic-spline fit + evaluation.
 
 This is the JAX analog of the C++ ``interpolate_wrap`` /
 ``CubicSplineWrap`` exposed by the ``gbt_backend_cpu`` /
@@ -8,16 +8,21 @@ selected backend is ``gbt_jax``.
 
 **Fit**: ``scipy.interpolate.CubicSpline`` with ``bc_type='not-a-knot'``
 (matches the C++ side). The fit runs once on the host at construction
-time and the resulting coefficients are stashed as ``jnp`` arrays.
-Autograd flows through the evaluation, not the fit -- which matches
-the use case (orbits / templates fit once, evaluated many times with
-gradients).
+time (a Python loop over the splines) and the resulting coefficients are
+stashed as ``jnp`` arrays. Autograd flows through the evaluation, not the
+fit -- which matches the use case (orbits / templates fit once, evaluated
+many times with gradients). scipy is required.
 
-**Eval**: pure JAX. Vectorized over the binary axis via ``jax.vmap``;
-``jax.jit`` + ``jax.grad`` work cleanly.
+**Eval**: pure JAX (:func:`evaluate_cubic_spline`, one spline per call; batch
+it with ``jax.vmap`` if needed). ``jax.jit`` + ``jax.grad`` work, with
+``derivative`` kept a static Python int.
 
 The per-segment cubic form
-        y(x) = y_i + c1_i*(x-x_i) + c2_i*(x-x_i)^2 + c3_i*(x-x_i)^3
+
+.. math::
+
+    y(x) = y_i + c_{1,i} (x - x_i) + c_{2,i} (x - x_i)^2 + c_{3,i} (x - x_i)^3
+
 is the same one the C++ wrapper exposes.
 """
 from __future__ import annotations
@@ -36,9 +41,14 @@ def _fit_one_not_a_knot_scipy(x_np: np.ndarray, y_np: np.ndarray
                               ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Fit one not-a-knot cubic spline using scipy.
 
-    Returns ``(c1, c2, c3)`` arrays of length ``N``. The last entry of
-    each is unused at evaluation time but kept for layout parity with
-    the C++ ``(ninterps*length,)`` storage.
+    Args:
+        x_np: Increasing knots, shape ``(N,)``.
+        y_np: Values at the knots, shape ``(N,)``.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray, np.ndarray]: ``(c1, c2, c3)`` arrays of length
+        ``N``. The last entry of each is unused at evaluation time (set to ``0.0``) but
+        kept for layout parity with the C++ ``(ninterps*length,)`` storage.
     """
     from scipy.interpolate import CubicSpline as _SciCubicSpline
     sp = _SciCubicSpline(x_np, y_np, bc_type="not-a-knot")
@@ -67,6 +77,17 @@ def fit_cubic_spline_not_a_knot(x_flat, y_flat, length: int, ninterps: int
 
     Inputs are ``(ninterps * length,)``; outputs are the same. Done
     host-side via scipy then transferred to JAX device.
+
+    Args:
+        x_flat (array_like): Knots of all splines, spline-major, shape
+            ``(ninterps * length,)``; any array convertible with ``np.asarray``.
+        y_flat (array_like): Values at the knots, same layout.
+        length: Number of knots per spline.
+        ninterps: Number of splines.
+
+    Returns:
+        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]: ``(c1, c2, c3)``, each of shape
+        ``(ninterps * length,)``; the last entry of every spline is ``0.0``.
     """
     x_np = np.asarray(x_flat).reshape(ninterps, length)
     y_np = np.asarray(y_flat).reshape(ninterps, length)
@@ -92,6 +113,20 @@ def interpolate_wrap_jax(x_flat, y_flat, B_flat, c1_flat, c2_flat, c3_flat,
     rebind them. :class:`gpubackendtools.interpolate.CubicSplineInterpolant`
     branches on the JAX backend to use the returned values rather
     than re-using the input buffers.
+
+    Args:
+        x_flat (array_like): Knots, shape ``(ninterps * length,)``.
+        y_flat (array_like): Values at the knots, same layout.
+        B_flat (array_like): Unused (kept for signature parity).
+        c1_flat (array_like): Unused.
+        c2_flat (array_like): Unused.
+        c3_flat (array_like): Unused.
+        length (int): Number of knots per spline.
+        ninterps (int): Number of splines.
+
+    Returns:
+        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]: ``(c1, c2, c3)`` from
+        :func:`fit_cubic_spline_not_a_knot`.
     """
     return fit_cubic_spline_not_a_knot(x_flat, y_flat, length, ninterps)
 
@@ -105,15 +140,41 @@ def evaluate_cubic_spline(x: jnp.ndarray, y: jnp.ndarray,
                           ) -> jnp.ndarray:
     """Evaluate one cubic spline at ``x_new``.
 
-    Args:
-        x, y, c1, c2, c3: 1D arrays of length ``N``; the spline data
-            from :func:`fit_cubic_spline_not_a_knot`.
-        x_new: query points (any shape).
-        derivative: 0..3; matches
-            :meth:`gpubackendtools.interpolate.CubicSplineInterpolant.__call__`.
+    The segment index is ``searchsorted(x, x_new, side="right") - 1`` clipped to
+    ``[0, N - 2]``, so out-of-range ``x_new`` is NOT clamped: it is extrapolated with the
+    first or last segment's cubic. Callers that want NaN / zero on out-of-bounds should
+    mask the output.
 
-    Out-of-range ``x_new`` is clamped to the spline domain. Callers
-    that want NaN / zero on out-of-bounds should mask the output.
+    Args:
+        x: Increasing knots, shape ``(N,)``.
+        y: Values at the knots, shape ``(N,)``.
+        c1: Linear coefficients, shape ``(N,)`` (e.g. one spline's slice of
+            :func:`fit_cubic_spline_not_a_knot` output).
+        c2: Quadratic coefficients, shape ``(N,)``.
+        c3: Cubic coefficients, shape ``(N,)``.
+        x_new: Query points (any shape).
+        derivative: Derivative order, 0 to 3; matches
+            :meth:`gpubackendtools.interpolate.CubicSplineInterpolant.__call__`.
+            Default ``0``.
+
+    Returns:
+        jnp.ndarray: Values (or derivatives) with the shape of ``x_new``.
+
+    Raises:
+        ValueError: If ``derivative`` is not 0-3.
+
+    Example:
+        .. code-block:: python
+
+            import jax.numpy as jnp
+            from gpubackendtools.jax.cubic_spline import (
+                evaluate_cubic_spline, fit_cubic_spline_not_a_knot,
+            )
+
+            x = jnp.linspace(0.0, 1.0, 50)
+            y = jnp.sin(x)
+            c1, c2, c3 = fit_cubic_spline_not_a_knot(x, y, length=50, ninterps=1)
+            vals = evaluate_cubic_spline(x, y, c1, c2, c3, jnp.array([0.3, 0.7]))
     """
     N = x.shape[0]
     flat = x_new.reshape(-1)
@@ -145,9 +206,34 @@ class CubicSplineWrapJAX:
 
     Constructor signature matches the C++ wrapper exactly so the
     existing call site
+
+    .. code-block:: python
+
         backend.CubicSplineWrap(x_flat, y_flat, c1_flat, c2_flat,
                                 c3_flat, ninterps, length, spline_type)
-    works unchanged on the JAX backend.
+
+    works unchanged on the JAX backend. Only the constructor is mirrored: there is no
+    ``eval_wrap``; evaluate with :meth:`evaluate_one`.
+
+    Args:
+        x_flat (array_like): Knots, shape ``(ninterps * length,)``.
+        y_flat (array_like): Values at the knots, same layout.
+        c1_flat (array_like): Linear coefficients, same layout.
+        c2_flat (array_like): Quadratic coefficients, same layout.
+        c3_flat (array_like): Cubic coefficients, same layout.
+        ninterps: Number of splines.
+        length: Number of knots per spline.
+        spline_type: Spacing code (stored, not used).
+
+    Attributes:
+        x_flat (jnp.ndarray): Knots as a JAX array.
+        y_flat (jnp.ndarray): Values as a JAX array.
+        c1_flat (jnp.ndarray): Linear coefficients as a JAX array.
+        c2_flat (jnp.ndarray): Quadratic coefficients as a JAX array.
+        c3_flat (jnp.ndarray): Cubic coefficients as a JAX array.
+        ninterps (int): Number of splines.
+        length (int): Number of knots per spline.
+        spline_type (int): Spacing code.
     """
 
     def __init__(self, x_flat, y_flat, c1_flat, c2_flat, c3_flat,
@@ -166,6 +252,14 @@ class CubicSplineWrapJAX:
 
         Convenience for downstream consumers that don't want to manage
         the ``(ninterps*length,)`` layout by hand.
+
+        Args:
+            interp_index: Spline index in ``[0, ninterps)``.
+            x_new (jnp.ndarray): Query points (any shape).
+            derivative: Derivative order, 0 to 3. Default ``0``.
+
+        Returns:
+            jnp.ndarray: :func:`evaluate_cubic_spline` output, shape of ``x_new``.
         """
         start = int(interp_index) * self.length
         stop = start + self.length

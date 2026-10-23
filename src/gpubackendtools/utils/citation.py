@@ -1,3 +1,11 @@
+# TODO check: keep/remove/document -- no importers; GBGPU-era BibTeX strings (FastGB, triples)
+"""Raw BibTeX strings: ``cornish_fastb``, ``robson_triple`` and ``zenodo``.
+
+The first two are GBGPU references (FastGB, Cornish & Littenberg 2007; hierarchical
+triples, Robson et al. 2018); ``zenodo`` is a software record titled for GPUBACKENDTOOLS.
+Not imported anywhere.
+"""
+
 cornish_fastb = """
 @article{Cornish:2007if,
     author = "Cornish, Neil J. and Littenberg, Tyson B.",

@@ -7,6 +7,8 @@
 
    user/gpubackendtools
    user/parallelbase
+   user/interpolate
+   user/globals
 
 .. toctree::
    :maxdepth: 4

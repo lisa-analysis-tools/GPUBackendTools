@@ -15,6 +15,15 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+"""Batched cubic-spline interpolation, the reference ``gpubackendtools`` compute object.
+
+:class:`CubicSplineInterpolant` fits many independent not-a-knot cubic splines at
+construction (native ``interpolate_wrap`` kernel on CPU / CUDA, scipy on the JAX backend)
+and evaluates them with array code on the backend's ``xp``. Downstream packages also pass
+its flat coefficient arrays to native code (:attr:`CubicSplineInterpolant.container`,
+:attr:`CubicSplineInterpolant.cpp_class_args`). :func:`searchsorted2d_vec` is the row-wise
+``searchsorted`` used by the evaluation.
+"""
 
 import numpy as np
 
@@ -24,6 +33,33 @@ from .pointeradjust import wrapper
 
 
 def searchsorted2d_vec(a, b, xp=None, **kwargs):
+    """Row-wise ``searchsorted`` of ``b`` into ``a`` in a single vectorized call.
+
+    Each row is shifted by ``row_index * M``, with ``M`` one more than the larger of the
+    value spans of ``a`` and ``b``, and one flat ``xp.searchsorted`` is run; the shift is
+    then removed from the indices. The result is exact when the shifted rows do not
+    interleave, i.e. when ``a`` and ``b`` cover a common value range (queries inside the
+    knot range, as in :meth:`CubicSplineInterpolant.__call__`). On CuPy the device is
+    synchronized before returning.
+
+    Args:
+        a (xp.ndarray): Sorted rows, shape ``(m, n)``.
+        b (xp.ndarray): Query rows, shape ``(m, k)``.
+        xp (module, optional): Array module (``numpy`` or ``cupy``). Default ``None``
+            means ``numpy``.
+        **kwargs: Forwarded to ``xp.searchsorted`` (e.g. ``side="right"``).
+
+    Returns:
+        xp.ndarray: Integer insertion indices into each row of ``a``, shape ``(m, k)``.
+
+    Example:
+        >>> import numpy as np
+        >>> from gpubackendtools.interpolate import searchsorted2d_vec
+        >>> a = np.array([[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]])
+        >>> b = np.array([[0.5, 1.5], [1.0, 1.9]])
+        >>> searchsorted2d_vec(a, b, side="right").tolist()
+        [[1, 2], [2, 2]]
+    """
     if xp is None:
         xp = np
 
@@ -41,18 +77,38 @@ def searchsorted2d_vec(a, b, xp=None, **kwargs):
     return out
 
 
+# Knot-spacing codes, same values as the CUBIC_SPLINE_* constants of InterpolateDevice.hh
+# (also exported by the native ``interp`` modules); passed to CubicSplineWrap as spline_type.
 CUBIC_SPLINE_LINEAR_SPACING = 1
 CUBIC_SPLINE_LOG10_SPACING = 2
 CUBIC_SPLINE_GENERAL_SPACING = 3 
 
 
 class CubicSplineInterpolant(GBTParallelModuleBase):
-    """GPU-accelerated Multiple Cubic Splines
+    r"""GPU-accelerated Multiple Cubic Splines.
 
     This class produces multiple cubic splines. The cubic splines are produced
-    with "not-a-knot" boundary conditions.
+    with "not-a-knot" boundary conditions (the same splines as
+    ``scipy.interpolate.CubicSpline`` with its default boundary condition).
 
-    This class has GPU capability.
+    This class has GPU capability. The fit runs once, at construction: on the C++ backends
+    through the native ``interpolate_wrap`` (a tridiagonal solve with LAPACKE ``dgtsv`` on
+    CPU, cuSPARSE ``gtsv2StridedBatch`` on GPU), which fills the coefficient buffers in
+    place; on ``gbt_jax`` through :func:`gpubackendtools.jax.cubic_spline.interpolate_wrap_jax`
+    (a host-side scipy fit). Evaluation (:meth:`__call__`) is array code on :attr:`xp`.
+    On segment ``i`` the spline is
+
+    .. math::
+
+        y(x) = y_i + c_{1,i} (x - x_i) + c_{2,i} (x - x_i)^2 + c_{3,i} (x - x_i)^3 .
+
+    The knot spacing is detected from ``x`` (linear, log10 or general) and stored in
+    :attr:`spline_type`; native consumers use it to pick the segment search.
+
+    Inputs are converted to the backend's array module with ``xp.asarray``, so NumPy input
+    to a CUDA backend is transferred to the device; ``x`` is always copied, while a 1D
+    ``y_all`` already on the right module is stored without a copy. The native kernels
+    require float64.
 
     Args:
         x (xp.ndarray): Independent-variable values for the splines. Either a
@@ -68,17 +124,47 @@ class CubicSplineInterpolant(GBTParallelModuleBase):
         length (int, optional): Number of points per spline. Required only when
             ``x`` / ``y_all`` are passed flattened (1D); otherwise it is
             ``x.shape[-1]``. (Default: ``None``)
-        spline_type (int, optional): Spacing hint (linear / log10 / general).
-            The spacing type is auto-detected from ``x`` and this argument is
-            overridden, so it does not normally need to be set. (Default:
+        spline_type (int, optional): Ignored: the spacing type is always
+            auto-detected from ``x`` and this value is overwritten. (Default:
             ``None``)
-        force_backend (str, optional): ``"cpu"``, ``"gpu"``, ``"cuda"``,
-            ``"cuda12x"``, ``"cuda11x"``, or ``"jax"``. Chooses the compute
-            backend at construction. (Default: ``None`` -- first available.)
+        force_backend (str | Backend | tuple[str, str], optional): ``"cpu"``,
+            ``"cuda11x"``, ``"cuda12x"``, ``"cuda13x"``, ``"jax"``, or the aliases
+            ``"cuda"`` / ``"gpu"`` (first available CUDA flavor); ``"gbt_"`` is
+            prepended unless the string already starts with it (see
+            :class:`~gpubackendtools.parallelbase.GBTParallelModuleBase`).
+            Chooses the compute backend at construction. (Default: ``None`` -- first
+            available of ``gbt_cuda13x``, ``gbt_cuda12x``, ``gbt_cuda11x``,
+            ``gbt_cpu``, ``gbt_jax``.)
 
     Raises:
-        ValueError: If input arguments are not correct.
+        ValueError: If input arguments are not correct: only one of ``x`` / ``y_all``
+            flattened, flattened input without ``length`` and ``ninterps``, lengths that
+            do not equal ``length * ninterps``, or N-D inputs of different shapes.
 
+    Attributes:
+        length (int): Number of knots per spline.
+        ninterps (int): Number of splines.
+        reshape_shape (tuple[int, ...]): Shape of the input ``x`` (N-D input) or
+            ``(ninterps, length)`` (flattened input).
+        degree (int): Always ``3``.
+        x_flat (xp.ndarray): Knots, shape ``(ninterps * length,)``.
+        y_flat (xp.ndarray): Values at the knots, shape ``(ninterps * length,)``.
+        c1_flat (xp.ndarray): Linear coefficients, shape ``(ninterps * length,)``; the
+            last entry of each spline is not used by the evaluation.
+        c2_flat (xp.ndarray): Quadratic coefficients, same layout.
+        c3_flat (xp.ndarray): Cubic coefficients, same layout.
+
+    Example:
+        >>> import numpy as np
+        >>> from gpubackendtools.interpolate import CubicSplineInterpolant
+        >>> x = np.tile(np.linspace(0.0, 1.0, 100), (2, 1))  # 2 splines of 100 knots
+        >>> y = np.stack([np.sin(2 * np.pi * x[0]), np.cos(2 * np.pi * x[1])])
+        >>> spl = CubicSplineInterpolant(x, y, force_backend="cpu")
+        >>> x_new = np.tile(np.linspace(0.1, 0.9, 7), (2, 1))
+        >>> spl(x_new).shape
+        (2, 7)
+        >>> spl(np.array([[0.25, 0.5]]), ind_interps=np.array([1])).shape  # spline 1 only
+        (1, 2)
     """
 
     def __init__(
@@ -198,6 +284,14 @@ class CubicSplineInterpolant(GBTParallelModuleBase):
 
     @property
     def spline_type(self) -> int:
+        """Detected knot spacing code: 1 linear, 2 log10, 3 general.
+
+        The values are the module constants ``CUBIC_SPLINE_LINEAR_SPACING``,
+        ``CUBIC_SPLINE_LOG10_SPACING`` and ``CUBIC_SPLINE_GENERAL_SPACING``.
+
+        Raises:
+            ValueError: On assignment of any other value.
+        """
         return self._spline_type
     
     @spline_type.setter
@@ -208,11 +302,12 @@ class CubicSplineInterpolant(GBTParallelModuleBase):
 
     @property
     def xp(self) -> object:
-        """Numpy or Cupy"""
+        """Array module of the backend: ``numpy``, ``cupy`` or ``jax.numpy``."""
         return self.backend.xp
     
     @classmethod
     def supported_backends(cls) -> list:
+        """``gbt_cuda13x``, ``gbt_cuda12x``, ``gbt_cuda11x``, ``gbt_cpu``, then ``gbt_jax``."""
         # Append the pure-JAX backend after the GPU/CPU options so that
         # the default "first available" pick stays GPU/CPU when both
         # are present. Users opt into the JAX path with
@@ -222,67 +317,83 @@ class CubicSplineInterpolant(GBTParallelModuleBase):
 
     @property
     def interpolate_arrays(self) -> callable:
-        """C/CUDA wrapped function for computing interpolation."""
+        """C/CUDA wrapped function for computing interpolation (``backend.interpolate_wrap``).
+
+        Signature ``(x, y, B, upper_diag, diag, lower_diag, length, ninterps)`` on flat
+        float64 arrays of size ``length * ninterps``. The native version fills the last
+        three buffers in place with ``c1``, ``c2``, ``c3``; the JAX version returns
+        ``(c1, c2, c3)``.
+        """
         return self.backend.interpolate_wrap
 
     @property
     def x(self):
-        """Get shaped x array."""
+        """Get shaped x array: knots with the input shape (:attr:`reshape_shape`)."""
         return self.x_flat.reshape(self.reshape_shape)
     
     @property
     def x_interp_shape(self):
-        """Get shaped x array."""
+        """Get x array with shape ``(ninterps, length)``."""
         return self.x_flat.reshape(self.ninterps, self.length)
 
     @property
     def y(self):
-        """Get shaped y array."""
+        """Get shaped y array (input shape, :attr:`reshape_shape`)."""
         return self.y_flat.reshape(self.reshape_shape)
     
     @property
     def y_interp_shape(self):
-        """Get shaped y array."""
+        """Get y array with shape ``(ninterps, length)``."""
         return self.y_flat.reshape(self.ninterps, self.length)
 
     @property
     def c1(self):
-        """Get shaped c1 array."""
+        """Get shaped c1 (linear coefficient) array (input shape, :attr:`reshape_shape`)."""
         return self.c1_flat.reshape(self.reshape_shape)
 
     @property
     def c1_interp_shape(self):
-        """Get shaped c1 array."""
+        """Get c1 array with shape ``(ninterps, length)``."""
         return self.c1_flat.reshape(self.ninterps, self.length)
     
     @property
     def c2(self):
-        """Get shaped c2 array."""
+        """Get shaped c2 (quadratic coefficient) array (input shape, :attr:`reshape_shape`)."""
         return self.c2_flat.reshape(self.reshape_shape)
 
     @property
     def c2_interp_shape(self):
-        """Get shaped c2 array."""
+        """Get c2 array with shape ``(ninterps, length)``."""
         return self.c2_flat.reshape(self.ninterps, self.length)
     
     @property
     def c3(self):
-        """Get shaped c3 array."""
+        """Get shaped c3 (cubic coefficient) array (input shape, :attr:`reshape_shape`)."""
         return self.c3_flat.reshape(self.reshape_shape)
 
     @property
     def c3_interp_shape(self):
-        """Get shaped c3 array."""
+        """Get c3 array with shape ``(ninterps, length)``."""
         return self.c3_flat.reshape(self.ninterps, self.length)
     
     @property
     def container(self):
-        """Container for easy transit of interpolation information."""
+        """Container for easy transit of interpolation information.
+
+        Returns:
+            list[xp.ndarray]: ``[x_flat, y_flat, c1_flat, c2_flat, c3_flat]``, each of shape
+            ``(ninterps * length,)`` (references, not copies).
+        """
         return [self.x_flat, self.y_flat, self.c1_flat, self.c2_flat, self.c3_flat]
     
     @property
     def cpp_class_args(self) -> tuple:
-        """Argument tuple for Cython class."""
+        """Constructor arguments of the native ``backend.CubicSplineWrap``.
+
+        Returns:
+            tuple: ``(x_flat, y_flat, c1_flat, c2_flat, c3_flat, ninterps, length,
+            spline_type)``.
+        """
         return (
             self.x_flat, 
             self.y_flat, 
@@ -296,6 +407,15 @@ class CubicSplineInterpolant(GBTParallelModuleBase):
 
     @property
     def cpp_class(self):
+        """Native ``CubicSplineWrap`` over this object's coefficient arrays.
+
+        Each access constructs a new wrapper from :attr:`cpp_class_args` and keeps it on
+        ``self._cpp_class``. The native wrapper's ``eval_wrap(y_new, x_new, spline_index, N)``
+        evaluates ``N`` points on the backend's device (``spline_index`` int32, one spline
+        index per point). On ``gbt_jax`` this is a
+        :class:`~gpubackendtools.jax.cubic_spline.CubicSplineWrapJAX`, which has no
+        ``eval_wrap``.
+        """
         # must store it or will lose access to attributes (do not do return self.backend...)
         self._cpp_class = self.backend.CubicSplineWrap(*self.cpp_class_args)
         return self._cpp_class
@@ -303,24 +423,40 @@ class CubicSplineInterpolant(GBTParallelModuleBase):
     def __call__(self, x_new, ind_interps = None, use_c_backend=False, error_out_of_bounds = True, derivative=0):
         """Evaluate the fitted splines at new abscissae.
 
+        Segments are located with :func:`searchsorted2d_vec` (``side="right"``) and the
+        segment cubic (or its derivative) is evaluated with :attr:`xp` array code; the
+        native ``CubicSpline`` evaluator is not used. On CuPy the default memory pool is
+        freed (``free_all_blocks``) before returning.
+
         Args:
-            x_new (xp.ndarray): Query points. When ``ind_interps`` is ``None``,
-                its leading axes must match ``x.shape[:-1]`` (one query row per
-                spline); the last axis is the queries for that spline.
+            x_new (xp.ndarray): Query points, on the backend's array module. When
+                ``ind_interps`` is ``None``, its leading axes must match ``x.shape[:-1]``
+                (one query row per spline; ``(ninterps, n_new)`` for flattened input);
+                the last axis is the queries for that spline.
             ind_interps (xp.ndarray, optional): Integer indices selecting which
-                splines to evaluate (must be unique). Required when ``x_new``
-                does not have one row per spline. (Default: ``None``.)
+                splines to evaluate (must be unique and in ``[0, ninterps)``), with shape
+                ``x_new.shape[:-1]``. Required when ``x_new`` does not have one row per
+                spline. (Default: ``None``.)
             use_c_backend (bool, optional): Reserved; currently raises
                 ``NotImplementedError`` if ``True``. (Default: ``False``.)
             error_out_of_bounds (bool, optional): If ``True``, raise when any
-                ``x_new`` falls outside the fitted range; if ``False``, clamp.
-                (Default: ``True``.)
-            derivative (int, optional): Derivative order to return (``0`` = the
-                interpolant itself, ``1`` = first derivative, ...). (Default:
-                ``0``.)
+                ``x_new`` falls outside the fitted range of its spline; if ``False``,
+                warn and set the out-of-range outputs to ``0.0``. (Default: ``True``.)
+            derivative (int, optional): Derivative order to return, ``0`` (the
+                interpolant itself) to ``3``. (Default: ``0``.)
 
         Returns:
-            xp.ndarray: Interpolated values with the shape of ``x_new``.
+            xp.ndarray: Interpolated values (or derivatives) with the shape of ``x_new``.
+
+        Raises:
+            ValueError: If ``x_new`` / ``ind_interps`` shapes do not match, a point is out
+                of bounds with ``error_out_of_bounds=True``, or ``derivative`` is not 0-3.
+            AssertionError: If ``ind_interps`` is out of range or has duplicates.
+            NotImplementedError: If ``use_c_backend`` is ``True``.
+
+        Warning:
+            On ``gbt_jax`` the in-place index fixes (a query equal to the last knot, or
+            zeroing out-of-range outputs) assign into immutable JAX arrays and fail.
         """
 
         if use_c_backend:
@@ -406,6 +542,7 @@ class CubicSplineInterpolant(GBTParallelModuleBase):
             self.xp.get_default_memory_pool().free_all_blocks()
         return y_new.reshape(input_shape)
     
+    # TODO check: keep/remove/document -- no callers; uses undefined x_shaped/y_shaped/c*_shaped
     def interp_special(self, x_new, inds):
         assert x_new.ndim == 1
         assert x_new.shape[0] == inds.shape[0]

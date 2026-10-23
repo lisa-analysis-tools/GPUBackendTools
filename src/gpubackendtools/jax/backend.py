@@ -10,6 +10,9 @@ implementations live in :mod:`gpubackendtools.jax.cubic_spline` as
 pure JAX functions. We subclass :class:`Backend` directly (not
 :class:`CpuBackend`) so the ``_check_module_installed`` importlib
 check is skipped; ``import jax`` is what we verify instead.
+
+Loading the backend (its first lookup) turns on ``jax_enable_x64`` in the global JAX
+config, for the whole process.
 """
 from __future__ import annotations
 
@@ -20,6 +23,12 @@ from ..cutils import GBTBackend, GBTBackendMethods
 
 
 def _check_jax():
+    """Import JAX, enable ``jax_enable_x64`` globally, and return ``jax.numpy``.
+
+    Raises:
+        TypeError: If JAX cannot be imported (the intended ``MissingDependency`` is built
+            with keyword arguments it does not accept).
+    """
     try:
         import jax  # noqa: F401
         import jax.numpy as jnp
@@ -35,6 +44,18 @@ def _check_jax():
 
 
 def _jax_methods_loader() -> GBTBackendMethods:
+    """Build the JAX method table from :mod:`gpubackendtools.jax.cubic_spline`.
+
+    ``interpolate_wrap`` is :func:`~gpubackendtools.jax.cubic_spline.interpolate_wrap_jax`,
+    ``fit_cubic_spline_thomas`` is
+    :func:`~gpubackendtools.jax.cubic_spline.fit_cubic_spline_not_a_knot`, both
+    ``CubicSplineWrap`` and ``CubicSpline`` are
+    :class:`~gpubackendtools.jax.cubic_spline.CubicSplineWrapJAX`, and
+    ``fit_cubic_spline_pcr`` is ``None``.
+
+    Returns:
+        GBTBackendMethods: Table with ``xp=jax.numpy``.
+    """
     jnp = _check_jax()
     from .cubic_spline import CubicSplineWrapJAX, fit_cubic_spline_not_a_knot, interpolate_wrap_jax
 
@@ -59,7 +80,23 @@ def _jax_methods_loader() -> GBTBackendMethods:
 
 
 class GBTJaxBackend(Backend, GBTBackend):
-    """JAX backend object plugged into ``Globals().backends_manager``."""
+    """JAX backend object plugged into ``Globals().backends_manager`` (key ``gbt_jax``).
+
+    Registered by ``import gpubackendtools`` when JAX is importable. Declares
+    ``Backend.Feature.NUMPY`` only, so ``uses_gpu`` is ``False`` even when JAX runs on a
+    GPU. Construction loads the method table (enabling ``jax_enable_x64``).
+
+    Args:
+        *args: Ignored.
+        **kwargs: Ignored.
+
+    Example:
+        .. code-block:: python
+
+            from gpubackendtools.interpolate import CubicSplineInterpolant
+
+            spl = CubicSplineInterpolant(x, y, force_backend="jax")  # backend gbt_jax
+    """
 
     _backend_name: str = "gbt_backend_jax"
     _name = "gbt_jax"
@@ -76,4 +113,5 @@ class GBTJaxBackend(Backend, GBTBackend):
 
     @staticmethod
     def _check_module_installed(*args, **kwargs):
+        """No-op: there is no plugin module to check."""
         return None
