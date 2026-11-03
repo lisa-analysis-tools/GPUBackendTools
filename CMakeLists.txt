@@ -95,22 +95,62 @@ set_property(GLOBAL APPEND PROPERTY GBT_OPTION_NAMES GBT_LAPACKE_FETCH)
 # LAPACKE. For example, if importing the CPU backend fails and complains about
 # missing "gfortran" symbols, set GBT_LAPACKE_EXTRA_LIBS=gfortran. Note that if
 # this option is unset, it will be automatically set to "gfortran" if that
-# library in linkable.
+# library is linkable.
+#
+# GBT_LAPACKE_LINK_DIRS is a companion option: extra directories added to
+# the linker search path when resolving GBT_LAPACKE_EXTRA_LIBS. Auto-detected
+# from CMAKE_Fortran_IMPLICIT_LINK_DIRECTORIES so builds on Apple Silicon
+# (Homebrew gcc's /opt/homebrew/Cellar/gcc/<ver>/lib/gcc/current), or any
+# other system where libgfortran is not on clang's default library search
+# path, resolve the Fortran runtime symbols pulled in by liblapack.a
+# (__gfortran_st_write, __gfortran_concat_string, ...). Explicit user
+# values are always honored.
 include(CheckLinkerFlag)
-check_linker_flag(CXX "-lgfortran" GFORTRAN_AVAILABLE)
-if(GFORTRAN_AVAILABLE)
-  message(STATUS "gfortran available.")
-  set(DEFAULT_EXTRA_LIBS "gfortran")
-else()
-  set(DEFAULT_EXTRA_LIBS "")
-  message(STATUS "gfortran NOT available.")
+
+set(DEFAULT_EXTRA_LIBS "")
+set(DEFAULT_EXTRA_LINK_DIRS "")
+
+# Preferred path: the Fortran language is already enabled by the top-level
+# project(... LANGUAGES CXX Fortran) call, so CMake has probed the Fortran
+# compiler and populated CMAKE_Fortran_IMPLICIT_LINK_{DIRECTORIES,LIBRARIES}
+# with exactly the directories/libs the Fortran driver would use. That is
+# the authoritative answer; -lgfortran alone under clang++ does not otherwise
+# see Homebrew gcc's runtime dir on Apple Silicon.
+if(CMAKE_Fortran_IMPLICIT_LINK_LIBRARIES)
+  list(FIND CMAKE_Fortran_IMPLICIT_LINK_LIBRARIES "gfortran" _gbt_gf_idx)
+  if(NOT _gbt_gf_idx EQUAL -1)
+    set(DEFAULT_EXTRA_LIBS "gfortran")
+    set(DEFAULT_EXTRA_LINK_DIRS "${CMAKE_Fortran_IMPLICIT_LINK_DIRECTORIES}")
+    message(STATUS "gfortran available via Fortran compiler implicit link "
+                   "directories: ${DEFAULT_EXTRA_LINK_DIRS}")
+  endif()
+  unset(_gbt_gf_idx)
 endif()
+
+# Fallback probe: bare -lgfortran with clang++'s default search path.
+# Covers Linux distros where libgfortran lives under /usr/lib/gcc/... and
+# systems without the Fortran language enabled.
+if(NOT DEFAULT_EXTRA_LIBS)
+  check_linker_flag(CXX "-lgfortran" GFORTRAN_AVAILABLE)
+  if(GFORTRAN_AVAILABLE)
+    message(STATUS "gfortran available on default linker search path.")
+    set(DEFAULT_EXTRA_LIBS "gfortran")
+  else()
+    message(STATUS "gfortran NOT available.")
+  endif()
+  unset(GFORTRAN_AVAILABLE)
+endif()
+
 set(GBT_LAPACKE_EXTRA_LIBS "${DEFAULT_EXTRA_LIBS}"
     CACHE STRING "Extra libs to link to when\
 linking against LAPACKE.")
+set(GBT_LAPACKE_LINK_DIRS "${DEFAULT_EXTRA_LINK_DIRS}"
+    CACHE STRING "Extra directories added to the linker search path when\
+ resolving GBT_LAPACKE_EXTRA_LIBS.")
 set_property(GLOBAL APPEND PROPERTY GBT_OPTION_NAMES GBT_LAPACKE_EXTRA_LIBS)
-unset(GFORTRAN_AVAILABLE)
+set_property(GLOBAL APPEND PROPERTY GBT_OPTION_NAMES GBT_LAPACKE_LINK_DIRS)
 unset(DEFAULT_EXTRA_LIBS)
+unset(DEFAULT_EXTRA_LINK_DIRS)
 
 
 # ---- Phony target for project specific properties ----

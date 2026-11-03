@@ -73,14 +73,35 @@ function(try_get_lapacke_with_pkgconfig)
     return()
   endif()
 
+  # Validate the imported target before declaring success. A stale
+  # lapacke.pc — e.g. one shipped into site-packages by a previous wheel
+  # build that used the FETCH strategy — reports include dirs under a
+  # deleted pip staging prefix (/tmp/tmpXXXX/wheel/platlib/include).
+  # Reject it here so detection falls through to the CMAKE / FETCH
+  # strategies instead of dying at CMake generate time.
+  get_target_property(TMP_LAPACKE_WITH_PKGCONFIG_INCLUDE_DIR
+                      PkgConfig::lapacke INTERFACE_INCLUDE_DIRECTORIES)
+  if(NOT TMP_LAPACKE_WITH_PKGCONFIG_INCLUDE_DIR)
+    set(TMP_LAPACKE_WITH_PKGCONFIG_INCLUDE_DIR "")
+  endif()
+  foreach(tmp_lapacke_incdir IN LISTS TMP_LAPACKE_WITH_PKGCONFIG_INCLUDE_DIR)
+    if(NOT EXISTS "${tmp_lapacke_incdir}")
+      message(CHECK_FAIL
+              "found a lapacke.pc, but it reports the non-existent include \
+directory '${tmp_lapacke_incdir}'. This is a stale .pc file (likely left in \
+site-packages by a previous build that fetched LAPACK); delete it or the \
+pkgconfig directory containing it.")
+      set(LAPACKE_WITH_PKGCONFIG_SUCCESS OFF PARENT_SCOPE)
+      set(LAPACKE_WITH_PKGCONFIG_REASON "STALE_LAPACKE_PC" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+
   message(CHECK_PASS
           "success! Found LAPACKE ${lapacke_VERSION} in ${lapacke_LIBDIR}")
   set(LAPACKE_WITH_PKGCONFIG_SUCCESS ON PARENT_SCOPE)
   set(LAPACKE_WITH_PKGCONFIG_LIBS PkgConfig::lapacke PARENT_SCOPE)
-  # 3. Get the include path property and store it in a variable
-  get_target_property(TMP_LAPACKE_WITH_PKGCONFIG_INCLUDE_DIR PkgConfig::lapacke INTERFACE_INCLUDE_DIRECTORIES)
   set(LAPACKE_WITH_PKGCONFIG_INCLUDE_DIR ${TMP_LAPACKE_WITH_PKGCONFIG_INCLUDE_DIR} PARENT_SCOPE)
-  message(STATUS "INSIDE: ${LAPACKE_WITH_PKGCONFIG_INCLUDE_DIR} ${TMP_LAPACKE_WITH_PKGCONFIG_INCLUDE_DIR}")
 endfunction()
 
 # try_get_lapacke_with_cpm
@@ -151,6 +172,14 @@ endfunction()
 function(get_lapacke) 
   # cmake-lint: disable=R0912,R0915
   message(CHECK_START "Locating LAPACKE")
+
+  # Normalize option values so lowercase/mixed-case (e.g. "on", "auto",
+  # "pkgconfig") work the same as the canonical uppercase forms advertised in
+  # the docs. All comparisons below are case-sensitive STREQUAL, so without
+  # this a value like GBT_LAPACKE_FETCH=on would silently match neither "ON"
+  # nor "AUTO" — disabling fetch AND failing to bypass pkgconfig.
+  string(TOUPPER "${GBT_LAPACKE_DETECT_WITH}" GBT_LAPACKE_DETECT_WITH)
+  string(TOUPPER "${GBT_LAPACKE_FETCH}" GBT_LAPACKE_FETCH)
 
   if (NOT ${GBT_LAPACKE_DETECT_WITH} AND NOT ${GBT_LAPACKE_FETCH})
     set(${GBT_LAPACKE_DETECT_WITH} "AUTO")
@@ -253,6 +282,16 @@ function(get_lapacke)
             the PKG_CONFIG_PATH environment variable.\n"
             "It is usually located in the library install path, in the \
             'lib/pkgconfig' subdirectory.")
+      elseif(LAPACKE_WITH_PKGCONFIG_REASON STREQUAL "STALE_LAPACKE_PC")
+        message(
+          WARNING
+            "PkgConfig found a 'lapacke.pc' whose include directory no \
+            longer exists — a stale file, typically installed into \
+            site-packages (lib/pkgconfig or lib64/pkgconfig) by a previous \
+            wheel build that fetched and bundled LAPACK.\n"
+            "Delete the stale lapacke.pc/lapack.pc/blas.pc (and the bundled \
+            lapack libs/headers next to them), or put the pkgconfig \
+            directory of a real LAPACK install earlier on PKG_CONFIG_PATH.")
       endif()
     endif()
     if(cmake_strategy_enabled)

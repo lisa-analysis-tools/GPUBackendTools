@@ -1,3 +1,4 @@
+# TODO check: keep/remove/document -- unimportable (imports missing utils.exceptions); no importers
 # Collection of citations for modules in GPUBACKENDTOOLS package
 
 """
@@ -6,6 +7,13 @@
 This module is used to collect citations for all modules in the package. This
 module is then imported to add citations to module classes using their :code:`citation`
 attribute.
+
+Warning:
+    Not importable as it stands: it imports ``InvalidInputFile`` from
+    ``gpubackendtools.utils.exceptions``, which does not exist. :func:`build_citation_registry`
+    also needs a ``CITATION.cff`` and ``cff_1_2_0.schema.json`` that ``gpubackendtools``
+    does not ship, and the :class:`REFERENCE` keys (FastGB, hierarchical triples) are
+    GBGPU references. Nothing in the package imports this module.
 """
 
 import abc
@@ -235,7 +243,10 @@ class SoftwareReference(ReferenceABC):
 Reference = Union[ArticleReference, SoftwareReference]
 
 
+# TODO check: keep/remove/document -- dead module (unimportable); keys are GBGPU references
 class REFERENCE(enum.Enum):
+    """Keys of the known references (values are ``CITATION.cff`` abbreviations)."""
+
     FAST_GB = "Cornish:2007if"
     TRIPLES_1 = "Robson:2018svj"
     GPUBACKENDTOOLS_SOFTWARE = "michael_l_katz_2022_6500434"
@@ -244,7 +255,10 @@ class REFERENCE(enum.Enum):
         return str(self.value)
 
 
+# TODO check: keep/remove/document -- dead module (unimportable); no callers
 class CitationRegistry:
+    """Mapping from reference key to :data:`Reference` object."""
+
     __slots__ = "registry"
 
     registry: dict[str, Reference]
@@ -260,6 +274,7 @@ class CitationRegistry:
         return self.registry.values()
 
 
+# TODO check: keep/remove/document -- dead module (unimportable); CITATION.cff/schema not shipped
 def build_citation_registry() -> CitationRegistry:
     """Read the package CITATION.cff and build the corresponding registry."""
     import json
@@ -320,6 +335,7 @@ COMMON_REFERENCES = [
 ]
 
 
+# TODO check: keep/remove/document -- dead module (unimportable); no subclasses
 class Citable:
     """Base class for classes associated with specific citations."""
 

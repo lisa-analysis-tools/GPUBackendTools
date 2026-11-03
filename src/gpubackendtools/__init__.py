@@ -1,4 +1,26 @@
-"""GPU Backend Tools."""
+"""GPU Backend Tools: the backend-dispatch framework of the LISA Analysis Tools stack.
+
+Importing the package registers the ``gpubackendtools`` backends on the shared registry
+(``Globals().backends_manager``): ``gbt_cpu``, ``gbt_cuda11x``, ``gbt_cuda12x``,
+``gbt_cuda13x``, plus ``gbt_jax`` when JAX is importable. Registration is lazy: a backend is
+built (and its plugin module imported) on its first lookup.
+
+Top-level names:
+
+- :func:`get_backend`, :func:`has_backend`, :func:`get_first_backend`, :class:`Globals`
+  (from :mod:`gpubackendtools.globals`);
+- :class:`ParallelModuleBase`, the base of every backend-dispatching class;
+- :func:`wrapper`, :func:`pointer_adjust`, legacy Cython pointer helpers;
+- :func:`get_include`, :func:`get_cmake_module_path`, for downstream C++ / CUDA builds.
+
+The reference compute object is
+:class:`gpubackendtools.interpolate.CubicSplineInterpolant` (import it from its module).
+
+Example:
+    >>> import gpubackendtools
+    >>> from gpubackendtools import has_backend
+    >>> cpu_ok = has_backend("gbt_cpu")
+"""
 
 # ruff: noqa: E402
 try:
@@ -34,18 +56,24 @@ def get_include() -> str:
 
     Downstream packages (LISAanalysistools, GBGPU, BBHx, FastEMRIWaveforms)
     add this to their compiler include path so that ``#include "gbt_global.h"``,
-    ``#include "cuda_complex.hpp"``, ``#include "InterpolateDevice.hh"``, and
-    ``#include "pybind11_cuda_array_interface.hpp"`` resolve against the
-    installed wheel's bundled headers (no sprint-tree path required).
+    ``#include "cuda_complex.hpp"`` and ``#include "InterpolateDevice.hh"``
+    resolve against the installed wheel's bundled headers (no sprint-tree path
+    required).
 
-    Example (CMake shell-out):
+    Returns:
+        str: The ``cutils/`` directory of the installed package.
 
-        execute_process(
-          COMMAND ${Python_EXECUTABLE} -c
-          "import gpubackendtools; print(gpubackendtools.get_include())"
-          OUTPUT_VARIABLE GBT_INCLUDE_DIR
-          OUTPUT_STRIP_TRAILING_WHITESPACE)
-        target_include_directories(my_target PRIVATE ${GBT_INCLUDE_DIR})
+    Example:
+        CMake shell-out:
+
+        .. code-block:: cmake
+
+            execute_process(
+              COMMAND ${Python_EXECUTABLE} -c
+              "import gpubackendtools; print(gpubackendtools.get_include())"
+              OUTPUT_VARIABLE GBT_INCLUDE_DIR
+              OUTPUT_STRIP_TRAILING_WHITESPACE)
+            target_include_directories(my_target PRIVATE ${GBT_INCLUDE_DIR})
     """
     import os.path
     return os.path.join(os.path.dirname(__file__), "cutils")
@@ -55,18 +83,24 @@ def get_cmake_module_path() -> str:
     """Absolute path to the directory containing ``GPUBackendToolsConfig.cmake``.
 
     For downstreams that prefer ``find_package(GPUBackendTools CONFIG)`` over
-    a Python shell-out:
+    a Python shell-out; the config defines the header-only
+    ``GPUBackendTools::headers`` interface target.
 
-        execute_process(
-          COMMAND ${Python_EXECUTABLE} -c
-          "import gpubackendtools; print(gpubackendtools.get_cmake_module_path())"
-          OUTPUT_VARIABLE GBT_CMAKE_DIR
-          OUTPUT_STRIP_TRAILING_WHITESPACE)
-        list(APPEND CMAKE_PREFIX_PATH ${GBT_CMAKE_DIR})
-        find_package(GPUBackendTools CONFIG REQUIRED)
+    Returns:
+        str: The same ``cutils/`` directory as :func:`get_include`, which ships
+        ``cmake_functions.cmake`` plus the installed ``GPUBackendToolsConfig.cmake``.
 
-    Returns the same ``cutils/`` directory that ships ``cmake_functions.cmake``
-    plus the installed ``GPUBackendToolsConfig.cmake``.
+    Example:
+        .. code-block:: cmake
+
+            execute_process(
+              COMMAND ${Python_EXECUTABLE} -c
+              "import gpubackendtools; print(gpubackendtools.get_cmake_module_path())"
+              OUTPUT_VARIABLE GBT_CMAKE_DIR
+              OUTPUT_STRIP_TRAILING_WHITESPACE)
+            list(APPEND CMAKE_PREFIX_PATH ${GBT_CMAKE_DIR})
+            find_package(GPUBackendTools CONFIG REQUIRED)
+            target_link_libraries(my_target PRIVATE GPUBackendTools::headers)
     """
     import os.path
     return os.path.join(os.path.dirname(__file__), "cutils")
@@ -82,6 +116,8 @@ from .parallelbase import ParallelModuleBase
 from .globals import Globals
 from .cutils import GBTCpuBackend, GBTCuda11xBackend, GBTCuda12xBackend, GBTCuda13xBackend
 
+# Registry key -> backend class for the gbt_* backends (a dict, not the
+# gpubackendtools.globals.add_backends function); published below.
 add_backends = {
     "gbt_cpu": GBTCpuBackend,
     "gbt_cuda11x": GBTCuda11xBackend,
@@ -101,6 +137,8 @@ except (ImportError, ModuleNotFoundError):
 Globals().backends_manager.add_backends(add_backends)
 
 
+# NOTE: get_logger, get_config, get_config_setter and get_file_manager are listed but not
+# imported here, so ``from gpubackendtools import *`` raises AttributeError.
 __all__ = [
     "__version__",
     "__version_tuple__",

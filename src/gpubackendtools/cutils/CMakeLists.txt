@@ -57,6 +57,10 @@ if(GBT_WITH_CPU)
                                         Interpolate.hh)
   target_link_libraries(gpubackendtools_cpu_interp_static LINK_PUBLIC ${GBT_LAPACKE_LIBS}
                         ${GBT_LAPACKE_EXTRA_LIBS})
+  if(GBT_LAPACKE_LINK_DIRS)
+    target_link_directories(gpubackendtools_cpu_interp_static PUBLIC
+                            ${GBT_LAPACKE_LINK_DIRS})
+  endif()
 
   nanobind_add_module(gpubackendtools_cpu_interp gbt_binding.cxx)
   apply_cpu_backend_common_options(interp gbt gpubackendtools false)
@@ -66,6 +70,10 @@ if(GBT_WITH_CPU)
                                       gbt_binding.hpp)
   target_link_libraries(gpubackendtools_cpu_interp LINK_PUBLIC ${GBT_LAPACKE_LIBS}
                         ${GBT_LAPACKE_EXTRA_LIBS})
+  if(GBT_LAPACKE_LINK_DIRS)
+    target_link_directories(gpubackendtools_cpu_interp PUBLIC
+                            ${GBT_LAPACKE_LINK_DIRS})
+  endif()
 
 endif()
 
